@@ -1,0 +1,1 @@
+# MinIO read/write wrapper
