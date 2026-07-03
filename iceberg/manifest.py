@@ -12,6 +12,13 @@ class ManifestEntry:
     record_count: int
     column_stats: Dict[int, Dict[str, Any]]
 
+class IcebergJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        from datetime import datetime
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
+
 @dataclass
 class Manifest:
     """A manifest containing a list of manifest entries."""
@@ -22,7 +29,7 @@ class Manifest:
 
     def to_json(self) -> str:
         """Serialize the manifest to a JSON string."""
-        return json.dumps(asdict(self), indent=2)
+        return json.dumps(asdict(self), cls=IcebergJSONEncoder, indent=2)
 
     def to_bytes(self) -> bytes:
         """Serialize the manifest to JSON bytes (for storage)."""
@@ -70,3 +77,45 @@ def read_manifest(key: str, store: MinIOStore) -> Manifest:
     """Read a manifest from MinIO using its object key."""
     data = store.get(key)
     return Manifest.from_bytes(data)
+
+
+@dataclass
+class ManifestListEntry:
+    manifest_path: str
+    added_snapshot_id: int
+    added_files_count: int
+    added_rows_count: int
+
+
+@dataclass
+class ManifestList:
+    entries: List[ManifestListEntry]
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), indent=2)
+
+    def to_bytes(self) -> bytes:
+        return self.to_json().encode("utf-8")
+
+    @classmethod
+    def from_json(cls, data: str) -> "ManifestList":
+        obj = json.loads(data)
+        entries = [ManifestListEntry(**e) for e in obj.get("entries", [])]
+        return cls(entries=entries)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ManifestList":
+        return cls.from_json(data.decode("utf-8"))
+
+
+def write_manifest_list(manifest_list: ManifestList, snapshot_id: int, store: MinIOStore) -> str:
+    """Write a manifest list to MinIO and return its object key."""
+    key = f"metadata/snap-{snapshot_id}-{uuid.uuid4()}.json"
+    store.put(key, manifest_list.to_bytes())
+    return key
+
+
+def read_manifest_list(key: str, store: MinIOStore) -> ManifestList:
+    """Read a manifest list from MinIO using its object key."""
+    data = store.get(key)
+    return ManifestList.from_bytes(data)
