@@ -20,3 +20,12 @@ class Column:
 class Schema:
     schema_id: int
     columns: List[Column]
+
+    def to_dict(self) -> dict:
+        from dataclasses import asdict
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Schema":
+        columns = [Column(**col) for col in data.get("columns", [])]
+        return cls(schema_id=data["schema_id"], columns=columns)
