@@ -6,7 +6,7 @@ from typing import List, Dict, Any
 import duckdb
 
 from iceberg.store import MinIOStore
-from iceberg.schema import Schema, PartitionSpec
+from iceberg.schema import Schema, Column, PartitionSpec
 from iceberg.parquet import write_parquet
 from iceberg.manifest import (
     ManifestEntry, Manifest, 
@@ -222,6 +222,83 @@ class Table:
         # 8. Write new versioned metadata file to MinIO
         write_metadata(self.metadata, self.store)
 
+    # ------------------------------------------------------------------ #
+    #  Schema Evolution                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _next_schema_id(self) -> int:
+        return max(s.schema_id for s in self.metadata.schemas) + 1
+
+    def _commit_schema(self, new_schema: Schema) -> None:
+        """Append new_schema to metadata, update current_schema_id, and persist."""
+        self.metadata.schemas.append(new_schema)
+        self.metadata.current_schema_id = new_schema.schema_id
+        self.metadata.last_column_id = max(
+            (col.field_id for col in new_schema.columns), default=self.metadata.last_column_id
+        )
+        self.metadata.last_updated_ms = int(time.time() * 1000)
+        write_metadata(self.metadata, self.store)
+        # Keep self.schema in sync
+        self.schema = new_schema
+
+    def add_column(self, name: str, type: str, required: bool = False) -> None:
+        """Add a new nullable column to the table schema.
+
+        - Assigns a new field_id (last_column_id + 1).
+        - Appends a new Schema to TableMetadata.schemas.
+        - Updates current_schema_id.
+        - Writes a new versioned metadata file.
+        - Does NOT touch any existing Parquet files.
+
+        New columns must be nullable (required=False) because existing Parquet
+        files don't have this column; they will return NULL when read.
+        """
+        if required:
+            raise ValueError(
+                "Cannot add a required column to a table that already has data. "
+                "Add it as nullable (required=False) instead."
+            )
+        new_field_id = self.metadata.last_column_id + 1
+        new_columns = list(self.schema.columns) + [
+            Column(field_id=new_field_id, name=name, type=type, required=False)
+        ]
+        new_schema = Schema(schema_id=self._next_schema_id(), columns=new_columns)
+        self._commit_schema(new_schema)
+        print(f"[schema] add_column '{name}' (field_id={new_field_id}, type={type}) → schema_id={new_schema.schema_id}")
+
+    def rename_column(self, field_id: int, new_name: str) -> None:
+        """Rename a column. The field_id stays the same.
+
+        Because Parquet files embed field_ids in their metadata, old files
+        can be read correctly under the new name without any rewrite.
+        """
+        new_columns = []
+        found = False
+        for col in self.schema.columns:
+            if col.field_id == field_id:
+                new_columns.append(Column(field_id=col.field_id, name=new_name, type=col.type, required=col.required))
+                found = True
+            else:
+                new_columns.append(col)
+        if not found:
+            raise ValueError(f"No column with field_id={field_id} in current schema.")
+        new_schema = Schema(schema_id=self._next_schema_id(), columns=new_columns)
+        self._commit_schema(new_schema)
+        print(f"[schema] rename_column field_id={field_id} → '{new_name}' (schema_id={new_schema.schema_id})")
+
+    def drop_column(self, field_id: int) -> None:
+        """Drop a column from the schema. Existing Parquet files are not touched.
+
+        Old files still contain the column's data; it is simply never selected
+        when reading under the new schema.
+        """
+        new_columns = [col for col in self.schema.columns if col.field_id != field_id]
+        if len(new_columns) == len(self.schema.columns):
+            raise ValueError(f"No column with field_id={field_id} in current schema.")
+        new_schema = Schema(schema_id=self._next_schema_id(), columns=new_columns)
+        self._commit_schema(new_schema)
+        print(f"[schema] drop_column field_id={field_id} → schema_id={new_schema.schema_id}")
+
     def scan(self, filter: Dict[str, Any] = None) -> List[str]:
         """Walk the current metadata tree and return Parquet data file paths.
 
@@ -319,32 +396,40 @@ class Table:
     def query(self, sql: str) -> List[Dict[str, Any]]:
         """Run a SQL query against the current snapshot's data.
 
-        1. Parses a single WHERE clause (if present) to build a filter.
-        2. scan(filter) skips files via predicate pushdown on manifest stats.
-        3. Remaining files are downloaded from MinIO into a temp directory.
-        4. DuckDB runs the full SQL and returns results as a list of dicts.
+        Schema-aware: reconciles Parquet files written under older schemas.
+        - Added columns: filled with None for rows from old files.
+        - Dropped columns: ignored when reading old files.
+        - Renamed columns: matched by field_id, returned under the current name.
 
         Use the actual table name in your SQL:
             SELECT * FROM {self.name} WHERE price > 500
-
-        Supported WHERE ops for file skipping: >, <, =
-        DuckDB always applies the full predicate on the rows it does read.
         """
         filter = self._parse_where(sql)
         file_paths = self.scan(filter=filter)
         if not file_paths:
             return []
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Download only the files that survived predicate pushdown
-            for i, remote_path in enumerate(file_paths):
-                local_path = os.path.join(tmpdir, f"part_{i}.parquet")
-                data = self.store.get(remote_path)
-                with open(local_path, "wb") as f:
-                    f.write(data)
+        # Current schema: the source of truth for column names and field_ids
+        current_cols = self.schema.columns          # columns in the current schema
+        current_field_ids = {col.field_id for col in current_cols}
+        current_name_by_fid = {col.field_id: col.name for col in current_cols}
 
-            # Use a single connection for both reading and querying
-            glob = os.path.join(tmpdir, "*.parquet")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            normalized_paths = []
+
+            for i, remote_path in enumerate(file_paths):
+                raw_bytes = self.store.get(remote_path)
+                raw_path = os.path.join(tmpdir, f"raw_{i}.parquet")
+                with open(raw_path, "wb") as f:
+                    f.write(raw_bytes)
+
+                # Normalize this file to the current schema
+                norm_path = os.path.join(tmpdir, f"part_{i}.parquet")
+                self._normalize_parquet(raw_path, norm_path, current_cols, current_name_by_fid, current_field_ids)
+                normalized_paths.append(norm_path)
+
+            # Build a UNION VIEW over all normalized files
+            glob = os.path.join(tmpdir, "part_*.parquet")
             conn = duckdb.connect()
             conn.execute(f"CREATE VIEW \"{self.name}\" AS SELECT * FROM read_parquet('{glob}')")
             cursor = conn.execute(sql)
@@ -352,6 +437,65 @@ class Table:
             rows = cursor.fetchall()
 
         return [dict(zip(columns, row)) for row in rows]
+
+    def _normalize_parquet(
+        self,
+        src_path: str,
+        dst_path: str,
+        current_cols: List[Any],
+        current_name_by_fid: Dict[int, str],
+        current_field_ids: set,
+    ) -> None:
+        """Read a single Parquet file and rewrite it aligned to the current schema.
+
+        Strategy:
+          1. Read the file's own schema from Parquet metadata to discover field_ids.
+          2. For each column in the CURRENT schema:
+               - If the file has that field_id: include it, using the CURRENT name.
+               - If the file is missing that field_id: fill with None (added column).
+          3. Columns in the file but NOT in the current schema are dropped.
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        file_table = pq.read_table(src_path)
+        file_schema = file_table.schema
+
+        # Build a map of field_id -> column index in the file's own schema
+        fid_to_file_col_idx: Dict[int, int] = {}
+        for idx, field in enumerate(file_schema):
+            fid_meta = field.metadata.get(b"field_id") if field.metadata else None
+            if fid_meta is not None:
+                fid_to_file_col_idx[int(fid_meta)] = idx
+
+        n_rows = len(file_table)
+        new_arrays = []
+        new_fields = []
+
+        for col in current_cols:
+            fid = col.field_id
+            if fid in fid_to_file_col_idx:
+                # Column exists in the file: take the data, rename to current name
+                arr = file_table.column(fid_to_file_col_idx[fid])
+                new_arrays.append(arr.cast(arr.type))  # identity cast keeps type
+                new_fields.append(pa.field(
+                    col.name, arr.type, nullable=not col.required,
+                    metadata={"field_id": str(fid)}
+                ))
+            else:
+                # Column was added after this file was written: fill with nulls
+                from iceberg.parquet import TYPE_MAP
+                pa_type = TYPE_MAP.get(col.type, pa.string())
+                new_arrays.append(pa.array([None] * n_rows, type=pa_type))
+                new_fields.append(pa.field(
+                    col.name, pa_type, nullable=True,
+                    metadata={"field_id": str(fid)}
+                ))
+
+        new_pa_schema = pa.schema(new_fields)
+        normalized = pa.table(new_arrays, schema=new_pa_schema)
+        pq.write_table(normalized, dst_path)
+
 
     def _parse_where(self, sql: str) -> Dict[str, Any] | None:
         """Extract a single WHERE condition from SQL and return a scan filter.
