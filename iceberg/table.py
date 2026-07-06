@@ -3,6 +3,7 @@ import time
 import uuid
 import tempfile
 from typing import List, Dict, Any
+import duckdb
 
 from iceberg.store import MinIOStore
 from iceberg.schema import Schema
@@ -10,7 +11,8 @@ from iceberg.parquet import write_parquet
 from iceberg.manifest import (
     ManifestEntry, Manifest, 
     ManifestListEntry, ManifestList, 
-    write_manifest, write_manifest_list
+    write_manifest, write_manifest_list,
+    read_manifest_list, read_manifest
 )
 from iceberg.snapshot import Snapshot
 from iceberg.metadata import TableMetadata, read_metadata, write_metadata
@@ -108,7 +110,6 @@ class Table:
         if self.metadata.current_snapshot_id:
             for snap in self.metadata.snapshots:
                 if snap.snapshot_id == self.metadata.current_snapshot_id:
-                    from iceberg.manifest import read_manifest_list
                     old_ml = read_manifest_list(snap.manifest_list, self.store)
                     previous_entries = old_ml.entries
                     break
@@ -143,3 +144,64 @@ class Table:
 
         # 8. Write new versioned metadata file to MinIO
         write_metadata(self.metadata, self.store)
+
+    def scan(self) -> List[str]:
+        """Walk the current metadata tree and return all Parquet data file paths.
+
+        Path:
+          metadata → current_snapshot_id → snapshot.manifest_list
+          → ManifestList.entries → each manifest → each ManifestEntry.file_path
+        """
+        if self.metadata.current_snapshot_id is None:
+            return []
+
+        # 1. Find the current snapshot
+        current_snapshot = next(
+            s for s in self.metadata.snapshots
+            if s.snapshot_id == self.metadata.current_snapshot_id
+        )
+
+        # 2. Read the manifest list for this snapshot
+        manifest_list = read_manifest_list(current_snapshot.manifest_list, self.store)
+
+        # 3. Read every manifest and collect every data file path
+        file_paths = []
+        for ml_entry in manifest_list.entries:
+            manifest = read_manifest(ml_entry.manifest_path, self.store)
+            for entry in manifest.entries:
+                file_paths.append(entry.file_path)
+
+        return file_paths
+
+    def query(self, sql: str) -> List[Dict[str, Any]]:
+        """Run a SQL query against the current snapshot's data.
+
+        1. scan() collects all Parquet file paths from the metadata tree.
+        2. Each file is downloaded from MinIO into a temp directory.
+        3. DuckDB runs the SQL against a glob over those local files.
+        4. The result is returned as a list of dicts.
+
+        Use the actual table name in your SQL, e.g.:
+            SELECT * FROM {self.name} WHERE id > 10
+        """
+        file_paths = self.scan()
+        if not file_paths:
+            return []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Download every Parquet file from MinIO
+            for i, remote_path in enumerate(file_paths):
+                local_path = os.path.join(tmpdir, f"part_{i}.parquet")
+                data = self.store.get(remote_path)
+                with open(local_path, "wb") as f:
+                    f.write(data)
+
+            # Use a single connection for both reading and querying
+            glob = os.path.join(tmpdir, "*.parquet")
+            conn = duckdb.connect()
+            conn.execute(f"CREATE VIEW \"{self.name}\" AS SELECT * FROM read_parquet('{glob}')")
+            cursor = conn.execute(sql)
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+
+        return [dict(zip(columns, row)) for row in rows]
