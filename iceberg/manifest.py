@@ -11,6 +11,7 @@ class ManifestEntry:
     file_size_bytes: int
     record_count: int
     column_stats: Dict[int, Dict[str, Any]]
+    partition_value: str = None   # e.g. "2024-01-15" for a day-partitioned table
 
 class IcebergJSONEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -52,7 +53,8 @@ class Manifest:
                     file_path=e["file_path"],
                     file_size_bytes=e["file_size_bytes"],
                     record_count=e["record_count"],
-                    column_stats=column_stats
+                    column_stats=column_stats,
+                    partition_value=e.get("partition_value"),
                 )
             )
         return cls(
