@@ -299,23 +299,61 @@ class Table:
         self._commit_schema(new_schema)
         print(f"[schema] drop_column field_id={field_id} → schema_id={new_schema.schema_id}")
 
-    def scan(self, filter: Dict[str, Any] = None) -> List[str]:
-        """Walk the current metadata tree and return Parquet data file paths.
+    # ------------------------------------------------------------------ #
+    #  Time Travel                                                         #
+    # ------------------------------------------------------------------ #
 
-        Two-level pruning when a filter is provided:
-          1. Partition pruning  — skip files whose partition_value proves they
-             cannot match the filter (no manifest-stat read needed).
-          2. Column-stat skipping — skip files where min/max stats rule out a match.
+    def snapshot_at(self, timestamp_ms: int) -> "Snapshot":
+        """Return the latest snapshot whose timestamp_ms <= the requested time.
 
-        Path:
-          metadata → current_snapshot_id → snapshot.manifest_list
-          → ManifestList.entries → each manifest → each ManifestEntry.file_path
+        Walks snapshot_log (which records every snapshot in chronological order)
+        and returns the newest entry that does not exceed the target timestamp.
+
+        Raises ValueError if the table had no snapshots before that point in time.
+
+        Usage:
+            snap = table.snapshot_at(1_720_000_000_000)
+            files = table.scan_snapshot(snap.snapshot_id)
         """
-        if self.metadata.current_snapshot_id is None:
-            return []
+        # snapshot_log entries: [{"timestamp_ms": ..., "snapshot_id": ...}, ...]
+        candidates = [
+            entry for entry in self.metadata.snapshot_log
+            if entry["timestamp_ms"] <= timestamp_ms
+        ]
+        if not candidates:
+            raise ValueError(
+                f"No snapshot exists at or before timestamp_ms={timestamp_ms}. "
+                f"Earliest snapshot is at {self.metadata.snapshot_log[0]['timestamp_ms'] if self.metadata.snapshot_log else 'N/A'}."
+            )
+        # The latest candidate is the one we want
+        log_entry = max(candidates, key=lambda e: e["timestamp_ms"])
+        target_id = log_entry["snapshot_id"]
 
-        # Resolve the partition column field_id → transform for the current spec
-        partition_field_ids: Dict[int, str] = {}  # {field_id: transform}
+        snap = next(
+            (s for s in self.metadata.snapshots if s.snapshot_id == target_id), None
+        )
+        if snap is None:
+            raise ValueError(f"snapshot_log references snapshot_id={target_id} but it is not in snapshots list.")
+        return snap
+
+    def scan_snapshot(self, snapshot_id: int, filter: Dict[str, Any] = None) -> List[str]:
+        """Walk a specific snapshot's manifest tree and return Parquet file paths.
+
+        Identical to scan() but targets an arbitrary past snapshot rather than
+        current_snapshot_id. Applies the same two-level pruning:
+          1. Partition pruning  — skip files whose partition_value doesn't match.
+          2. Column-stat skipping — skip files where min/max rules out a match.
+
+        This is the engine behind time travel queries.
+        """
+        target_snapshot = next(
+            (s for s in self.metadata.snapshots if s.snapshot_id == snapshot_id), None
+        )
+        if target_snapshot is None:
+            raise ValueError(f"Snapshot {snapshot_id} not found in table metadata.")
+
+        # Resolve partition spec (same logic as scan())
+        partition_field_ids: Dict[int, Any] = {}
         current_spec = next(
             (s for s in self.metadata.partition_specs
              if s.spec_id == self.metadata.current_spec_id),
@@ -325,16 +363,8 @@ class Table:
             for pf in current_spec.fields:
                 partition_field_ids[pf.field_id] = pf
 
-        # 1. Find the current snapshot
-        current_snapshot = next(
-            s for s in self.metadata.snapshots
-            if s.snapshot_id == self.metadata.current_snapshot_id
-        )
+        manifest_list = read_manifest_list(target_snapshot.manifest_list, self.store)
 
-        # 2. Read the manifest list for this snapshot
-        manifest_list = read_manifest_list(current_snapshot.manifest_list, self.store)
-
-        # 3. Read every manifest; apply partition pruning then column-stat skipping
         file_paths = []
         skipped = []
         for ml_entry in manifest_list.entries:
@@ -342,70 +372,174 @@ class Table:
             for entry in manifest.entries:
                 fname = entry.file_path.split("/")[-1]
 
-                # --- Partition pruning (cheapest: no network I/O needed) ---
-                partition_confirmed = False   # True = this file is in the right partition
+                # --- Partition pruning ---
+                partition_confirmed = False
                 if (
                     filter
                     and entry.partition_value is not None
                     and filter["field_id"] in partition_field_ids
                 ):
                     pf = partition_field_ids[filter["field_id"]]
-                    # Compute what partition key the filter value maps to
                     try:
                         target_partition = pf.apply(filter["value"])
                     except Exception:
                         target_partition = None
-
                     if target_partition:
                         if entry.partition_value != target_partition:
-                            print(
-                                f"[scan] SKIP  {fname}  "
-                                f"(partition pruning: file={entry.partition_value}, "
-                                f"filter={filter['op']} {filter['value']} → target={target_partition})"
-                            )
+                            print(f"[scan_snapshot] SKIP {fname} (partition: {entry.partition_value} != {target_partition})")
                             skipped.append(fname)
                             continue
                         else:
-                            # The file is in the correct partition — don't let column-stat
-                            # skipping override this, because the transform coarsens the value
-                            # (e.g. day=2024-01-15 covers all timestamps on that day, but the
-                            # filter value 00:00:00 would look like it falls outside the file's
-                            # min/max of 12:00:00 for the same day).
                             partition_confirmed = True
 
-                # --- Column-stat skipping (reads manifest JSON, already in memory) ---
-                # Only apply if partition pruning did NOT already confirm this file.
+                # --- Column-stat skipping ---
                 if filter and not partition_confirmed and _should_skip(entry, filter):
                     col_stats = entry.column_stats.get(filter["field_id"], {})
                     print(
-                        f"[scan] SKIP  {fname}  "
-                        f"(stats: min={col_stats.get('min')}, max={col_stats.get('max')}  "
+                        f"[scan_snapshot] SKIP {fname} "
+                        f"(stats: min={col_stats.get('min')}, max={col_stats.get('max')} "
                         f"filter: {filter['op']} {filter['value']})"
                     )
                     skipped.append(fname)
                     continue
 
-                print(f"[scan] OPEN  {fname}")
+                print(f"[scan_snapshot] OPEN {fname}")
                 file_paths.append(entry.file_path)
 
         if filter:
-            print(f"[scan] → {len(file_paths)} file(s) opened, {len(skipped)} skipped.")
-
+            print(f"[scan_snapshot] → {len(file_paths)} file(s) opened, {len(skipped)} skipped.")
         return file_paths
 
-    def query(self, sql: str) -> List[Dict[str, Any]]:
-        """Run a SQL query against the current snapshot's data.
+    def expire_snapshots(self, older_than_ms: int) -> None:
+        """Expire snapshots older than the given timestamp.
+
+        Removes old snapshots from the history. We ALWAYS protect the
+        current_snapshot_id so the table remains readable, even if it is
+        older than older_than_ms.
+        """
+        new_snapshots = []
+        for s in self.metadata.snapshots:
+            if s.snapshot_id == self.metadata.current_snapshot_id or s.timestamp_ms >= older_than_ms:
+                new_snapshots.append(s)
+            else:
+                print(f"[expire] Expired snapshot {s.snapshot_id} (ts={s.timestamp_ms})")
+
+        self.metadata.snapshots = new_snapshots
+
+        # 3. Update snapshot_log to match remaining snapshots
+        kept_ids = {s.snapshot_id for s in new_snapshots}
+        self.metadata.snapshot_log = [
+            e for e in self.metadata.snapshot_log if e["snapshot_id"] in kept_ids
+        ]
+
+        self.metadata.last_updated_ms = int(time.time() * 1000)
+        write_metadata(self.metadata, self.store)
+
+    def delete_orphan_files(self) -> None:
+        """Find and delete orphan files in MinIO.
+
+        1. Walks current metadata tree to find all valid referenced files.
+        2. Lists all objects in MinIO under the table's location.
+        3. Deletes objects that are not referenced.
+        """
+        # Because this simplified implementation writes manifests and manifest lists
+        # to a shared global metadata/ folder (metadata/manifests/, metadata/snap-*),
+        # we must collect referenced files from ALL tables to avoid deleting
+        # another table's valid manifests.
+        referenced_files = set()
+        
+        # Discover all tables in the warehouse
+        table_prefixes = set()
+        for key in self.store.list("metadata/tables/"):
+            parts = key.split("/")
+            if len(parts) >= 3:
+                table_prefixes.add(f"metadata/tables/{parts[2]}/")
+        
+        # Load every table and collect references
+        import json
+        for t_prefix in table_prefixes:
+            # Find the latest metadata file for this table
+            meta_files = [k for k in self.store.list(t_prefix) if k.endswith(".metadata.json")]
+            if not meta_files:
+                continue
+            import os
+            latest_meta_key = max(meta_files, key=lambda k: int(os.path.basename(k).split("v")[1].split(".")[0]))
+            
+            # Read its snapshots
+            meta_json = json.loads(self.store.get(latest_meta_key).decode("utf-8"))
+            for s_dict in meta_json.get("snapshots", []):
+                ml_key = s_dict["manifest_list"]
+                referenced_files.add(ml_key)
+                try:
+                    ml = read_manifest_list(ml_key, self.store)
+                    for ml_entry in ml.entries:
+                        referenced_files.add(ml_entry.manifest_path)
+                        m = read_manifest(ml_entry.manifest_path, self.store)
+                        for m_entry in m.entries:
+                            referenced_files.add(m_entry.file_path)
+                except Exception:
+                    pass  # Skip if already missing
+
+        # 2. List all objects that could potentially be orphans
+        prefix_to_strip = f"s3://{self.store.bucket_name}/"
+        base_key = (
+            self.metadata.location[len(prefix_to_strip):]
+            if self.metadata.location.startswith(prefix_to_strip)
+            else self.metadata.location
+        )
+        
+        # We check this table's data directory, plus the global manifest directories
+        all_objects = (
+            self.store.list(f"{base_key}/data/") + 
+            self.store.list("metadata/manifests/") + 
+            [k for k in self.store.list("metadata/") if k.startswith("metadata/snap-")]
+        )
+
+        # 3. Delete orphans
+        deleted_count = 0
+        for obj in all_objects:
+            if obj not in referenced_files:
+                print(f"[orphan] Deleting orphan file: {obj}")
+                self.store.client.remove_object(self.store.bucket_name, obj)
+                deleted_count += 1
+                
+        print(f"[orphan] Deleted {deleted_count} orphan file(s).")
+
+    def scan(self, filter: Dict[str, Any] = None) -> List[str]:
+        """Walk the current snapshot's manifest tree and return Parquet file paths.
+
+        Delegates to scan_snapshot(current_snapshot_id) so all pruning logic
+        lives in one place.
+        """
+        if self.metadata.current_snapshot_id is None:
+            return []
+        return self.scan_snapshot(self.metadata.current_snapshot_id, filter=filter)
+
+    def query(self, sql: str, as_of: int = None) -> List[Dict[str, Any]]:
+        """Run a SQL query against the table.
+
+        as_of: optional Unix milliseconds timestamp. When provided, the query
+        reads the latest snapshot that existed at that point in time instead of
+        the current snapshot — this is Iceberg time travel.
 
         Schema-aware: reconciles Parquet files written under older schemas.
         - Added columns: filled with None for rows from old files.
         - Dropped columns: ignored when reading old files.
         - Renamed columns: matched by field_id, returned under the current name.
 
-        Use the actual table name in your SQL:
-            SELECT * FROM {self.name} WHERE price > 500
+        Note: we always reconcile against the CURRENT schema even for time-travel
+        queries. This is the simplest correct approach; a full implementation would
+        use the schema that was active at the target snapshot.
         """
         filter = self._parse_where(sql)
-        file_paths = self.scan(filter=filter)
+
+        if as_of is not None:
+            snap = self.snapshot_at(as_of)
+            print(f"[time-travel] as_of={as_of} → snapshot_id={snap.snapshot_id} (ts={snap.timestamp_ms})")
+            file_paths = self.scan_snapshot(snap.snapshot_id, filter=filter)
+        else:
+            file_paths = self.scan(filter=filter)
+
         if not file_paths:
             return []
 
@@ -509,16 +643,19 @@ class Table:
         Multi-condition clauses (AND/OR) are not parsed; scan() will read all files.
         """
         import re
-        # Match a single simple condition; stop before AND/OR/GROUP/ORDER/LIMIT
+        # Match a simple condition. Values can be numbers (12.3) or single-quoted strings ('Jan 3')
         pattern = re.compile(
-            r"WHERE\s+(\w+)\s*(>|<|=)\s*([\d.]+)",
+            r"WHERE\s+(\w+)\s*(>|<|=)\s*('([^']+)'|[\d.]+)",
             re.IGNORECASE
         )
         m = pattern.search(sql)
         if not m:
             return None
 
-        col_name, op_sym, raw_value = m.group(1), m.group(2), m.group(3)
+        col_name, op_sym = m.group(1), m.group(2)
+        
+        # If it was a quoted string, group 4 has the inner text. Otherwise group 3 has the number.
+        raw_value = m.group(4) if m.group(4) is not None else m.group(3)
 
         # Map symbol → our op string
         op_map = {">": "gt", "<": "lt", "=": "eq"}
@@ -534,8 +671,10 @@ class Table:
             value: float | int | str
             if col.type in ("int", "long"):
                 value = int(raw_value)
-            else:
+            elif col.type == "double":
                 value = float(raw_value)
+            else:
+                value = str(raw_value)
         except ValueError:
             return None
 
