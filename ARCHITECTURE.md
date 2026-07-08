@@ -121,20 +121,20 @@ query(sql)
     │
     │      Level 1: PARTITION PRUNING (cheapest — string comparison only)
     │      ┌──────────────────────────────────────────────────────────┐
-    │      │  filter field_id (4) is a partition field (identity)    │
-    │      │  entry.partition_value = "2024-01-14"                   │
-    │      │  target = apply(identity, "2024-01-15") = "2024-01-15"  │
-    │      │  "2024-01-14" ≠ "2024-01-15"  →  SKIP this file        │
+    │      │  filter field_id (4) is a partition field (identity)     │
+    │      │  entry.partition_value = "2024-01-14"                    │
+    │      │  target = apply(identity, "2024-01-15") = "2024-01-15"   │
+    │      │  "2024-01-14" ≠ "2024-01-15"  →  SKIP this file          │
     │      └──────────────────────────────────────────────────────────┘
     │
     │      Level 2: COLUMN-STAT SKIPPING (applied if partition doesn't match)
     │      ┌──────────────────────────────────────────────────────────┐
     │      │  filter: price > 1500                                    │
-    │      │  entry.column_stats[field_id=3] = {min: 10.5, max: 200} │
-    │      │  max (200) <= value (1500)  →  SKIP this file           │
+    │      │  entry.column_stats[field_id=3] = {min: 10.5, max: 200}  │
+    │      │  max (200) <= value (1500)  →  SKIP this file            │
     │      │                                                          │
-    │      │  entry.column_stats[field_id=3] = {min: 1400, max: 2000}│
-    │      │  max (2000) > value (1500)  →  OPEN this file           │
+    │      │  entry.column_stats[field_id=3] = {min: 1400, max: 2000} │
+    │      │  max (2000) > value (1500)  →  OPEN this file            │
     │      └──────────────────────────────────────────────────────────┘
     │
     ├─ 5. DOWNLOAD only the surviving Parquet files from MinIO
