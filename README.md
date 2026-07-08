@@ -2,15 +2,19 @@
 
 A from-scratch implementation of the Apache Iceberg table format spec, demonstrating how ACID guarantees, schema evolution, and time travel work at the file level in object storage systems. This is not a wrapper around PyIceberg — it reimplements the metadata tree, manifest protocol, and snapshot chain directly, so you can read the code and understand exactly why Iceberg works the way it does.
 
+## The Core Insight
+
+Object storage is cheap and infinitely scalable, but it has no concept of transactions, schema, or history. If you overwrite an object, the old version is gone. The trick Iceberg discovered is to put **all the intelligence into an immutable metadata tree** — not into the storage layer. No file is ever edited in place. Every write creates a new file. ACID semantics, time travel, and schema evolution are all emergent properties of that one design decision.
+
 ---
 
 ## Features
 
 - **Atomic snapshot commits** — every `append()` produces an immutable snapshot; partial writes never become visible
-- **Schema evolution without rewriting data** — add, rename, and drop columns; old Parquet files are reconciled at query time by matching `field_id`, not column name
-- **File skipping via column min/max statistics** — manifests store per-file `{min, max}` so queries skip files that cannot match the filter without opening them
-- **Partition pruning** — identity, day, month, and year transforms; partition-filtered queries skip files at the manifest level, before any statistics are read
-- **Time travel** — `query(sql, as_of=timestamp_ms)` walks the `snapshot_log` and reads the exact file set that existed at that moment; overhead is a single in-memory list scan
+- **Schema evolution without rewriting data** — add, rename, and drop columns; old Parquet files are reconciled at query time by matching `field_id` integer tags, not column names
+- **File skipping via column min/max statistics** — manifests store per-file `{min, max}` so queries skip files that cannot match the filter without opening them. Statistics can *exclude* files, never *guarantee* a match — files that pass the stats check are still opened.
+- **Partition pruning** — identity, day, month, and year transforms; partition-filtered queries skip files at the manifest level, before any statistics are read. Faster than file skipping because no manifest JSON needs to be fetched first.
+- **Time travel** — `query(sql, as_of=timestamp_ms)` scans the `snapshot_log` (a flat in-memory list of `{timestamp_ms, snapshot_id}` pairs) to find the snapshot that was current at that moment, then reads exactly the files that existed then. Overhead: < 10ms, measured.
 - **Snapshot expiry and orphan file cleanup** — `expire_snapshots(older_than_ms)` trims old history; `delete_orphan_files()` removes unreferenced Parquet files and manifests from MinIO
 
 ---
@@ -70,6 +74,8 @@ Measured on a local machine against MinIO in Docker. Numbers illustrate the cost
 
 **Key insight:** metadata is the bottleneck, not data. Each `append()` requires three sequential object-storage writes (manifest → manifest list → table metadata). In production Iceberg this is replaced by a single atomic catalog commit (e.g., AWS Glue), which is why production write throughput is orders of magnitude higher.
 
+**File skipping vs partition pruning:** partition pruning fires first, at the ManifestList level, eliminating entire manifests with a single string comparison that's already in memory. File skipping fires second, at the individual manifest entry level, after the manifest JSON has been downloaded. In the benchmark above, a query for one specific day skips 97% of files via partition pruning and never even reads the other 29 manifests.
+
 Run the benchmark yourself:
 
 ```bash
@@ -103,6 +109,8 @@ The full design is documented in [ARCHITECTURE.md](ARCHITECTURE.md), covering:
 | Schema at time-travel timestamp | ⚠️ | Always reconciles to current schema even for `as_of` queries. |
 
 These are intentional simplifications for an educational implementation. See [ARCHITECTURE.md §7](ARCHITECTURE.md#7-what-we-simplified-vs-real-iceberg) for a full explanation of what each simplification costs in production.
+
+**Why JSON instead of Avro for manifests?** Honest answer: Avro adds schema definition, binary encoding, and a schema registry dependency — three new concepts — without helping you understand anything new about how Iceberg works. JSON manifests are readable in any text editor; you can see exactly what's stored. The cost is real (JSON is ~3–5× larger and slower to parse than Avro), but for learning, the transparency is worth it.
 
 ---
 
