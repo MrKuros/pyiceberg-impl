@@ -1,6 +1,6 @@
 # pyiceberg-impl
 
-A from-scratch implementation of the Apache Iceberg table format spec, demonstrating how ACID guarantees, schema evolution, and time travel work at the file level in object storage systems. This is not a wrapper around PyIceberg — it reimplements the metadata tree, manifest protocol, and snapshot chain directly, so you can read the code and understand exactly why Iceberg works the way it does.
+A from-scratch reimplementation of the core Apache Iceberg concepts, demonstrating how ACID guarantees, schema evolution, and time travel work at the file level in object storage systems. This is not a wrapper around PyIceberg — it reimplements the metadata tree, manifest protocol, and snapshot chain directly, so you can read the code and understand exactly why Iceberg works the way it does. Note: it is educational and **not wire-compatible with real Iceberg** — manifests are JSON, not Avro, so Spark/PyIceberg cannot read these tables (see "What Is NOT Implemented").
 
 ## The Core Insight
 
@@ -155,7 +155,7 @@ iceberg/
 
 tests/
   test_parquet.py       — Parquet write/read/stats (no MinIO)
-  test_placeholder.py   — Schema, file-skipping logic, integration tests
+  test_iceberg.py       — Schema, file-skipping logic, integration tests
 
 demo.py         — End-to-end: schema evolution + time travel + lifecycle
 benchmark.py    — Throughput and pruning measurements

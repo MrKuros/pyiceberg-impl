@@ -180,8 +180,11 @@ class Table:
         manifest_key = write_manifest(manifest, self.store)
 
         # 5. Create ManifestList and upload
-        snapshot_id = int(time.time() * 1000)
-        
+        now_ms = int(time.time() * 1000)
+        # Random 63-bit id (real Iceberg uses random longs) so two appends in the
+        # same millisecond don't collide on snapshot_id / manifest-list key.
+        snapshot_id = uuid.uuid4().int & ((1 << 63) - 1)
+
         # Carry over previous manifest list entries
         previous_entries = []
         if self.metadata.current_snapshot_id:
@@ -205,7 +208,7 @@ class Table:
             snapshot_id=snapshot_id,
             parent_snapshot_id=self.metadata.current_snapshot_id,
             sequence_number=len(self.metadata.snapshots) + 1,
-            timestamp_ms=snapshot_id,
+            timestamp_ms=now_ms,
             manifest_list=ml_key,
             summary={"operation": "append"},
         )
@@ -213,9 +216,9 @@ class Table:
         # 7. Update TableMetadata
         self.metadata.snapshots.append(snapshot)
         self.metadata.current_snapshot_id = snapshot_id
-        self.metadata.last_updated_ms = snapshot_id
+        self.metadata.last_updated_ms = now_ms
         self.metadata.snapshot_log.append({
-            "timestamp_ms": snapshot_id,
+            "timestamp_ms": now_ms,
             "snapshot_id": snapshot_id,
         })
 
@@ -600,7 +603,7 @@ class Table:
         for idx, field in enumerate(file_schema):
             fid_meta = field.metadata.get(b"field_id") if field.metadata else None
             if fid_meta is not None:
-                fid_to_file_col_idx[int(fid_meta)] = idx
+                fid_to_file_col_idx[int(fid_meta.decode())] = idx
 
         n_rows = len(file_table)
         new_arrays = []
